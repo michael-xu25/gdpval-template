@@ -15,15 +15,20 @@ is never baked into the image.
 # params (e.g. `rubric: dict | None`) must stay real types or hud's arg coercion
 # and manifest generation break.
 
+import glob
 import importlib.util
 import inspect
+import math
 import os
 import shutil
 import subprocess
 import sys
+import time
 import types
+from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hud import Environment
 from hud.environment import Workspace
@@ -60,6 +65,89 @@ SOLVER_ENV_SECRET_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTI
 env = Environment(name="gdpval-template")
 
 
+# ---------------------------------------------------------------------------
+# Task clock: an optional in-world "now" for the solver shell.
+#
+# Knowledge-work tasks are often set at a specific moment (a Q3 close, a reply due
+# before Friday's call, an email archive frozen at a cutoff). Without a clock the
+# agent's `date` and every library it calls report the container's real time, so a
+# memo "dated today" carries the wrong date. A task opts in with `current_time`
+# (ISO 8601) and optionally `timezone` (IANA name). The prompt states the time, the
+# shell gets TZ, and — where libfaketime is installed (the image) — every process
+# in the shell sees the task's time, advancing at real speed from task start.
+# ---------------------------------------------------------------------------
+
+# The active task's clock; set at task start, cleared when the task finishes.
+_TASK_CLOCK: dict[str, Any] | None = None
+
+LIBFAKETIME_GLOBS = (
+    "/usr/lib/*-linux-gnu/faketime/libfaketime.so.1",
+    "/usr/lib/faketime/libfaketime.so.1",
+    "/usr/local/lib/faketime/libfaketime.so.1",
+)
+
+
+def _find_libfaketime() -> str | None:
+    """Path to libfaketime's shared object, or None (e.g. macOS / a bare dev box)."""
+    for pattern in LIBFAKETIME_GLOBS:
+        hits = sorted(glob.glob(pattern))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _parse_task_clock(current_time: str, tz_name: str) -> dict[str, Any] | None:
+    """Validate the clock args. Returns None when the task sets no clock.
+
+    A naive `current_time` is read in `tz_name`; one with an offset is converted
+    to it. The offset is fixed at task start, so the shell clock then advances in
+    real time and stays consistent across commands.
+    """
+    if not (current_time or "").strip():
+        return None
+    try:
+        zone = ZoneInfo(tz_name or "UTC")
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise RuntimeError(f"unknown timezone {tz_name!r}") from exc
+    try:
+        moment = datetime.fromisoformat(current_time.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"current_time must be ISO 8601, got {current_time!r}") from exc
+    moment = moment.replace(tzinfo=zone) if moment.tzinfo is None else moment.astimezone(zone)
+    return {
+        "start": moment,
+        "timezone": zone.key,
+        # task time minus wall time, in whole seconds (libfaketime's relative form).
+        # Rounded up, so the shell clock never reads earlier than current_time.
+        "offset_seconds": math.ceil(moment.timestamp() - time.time()),
+    }
+
+
+def _task_now(clock: dict[str, Any]) -> datetime:
+    """The task clock's current reading."""
+    return datetime.fromtimestamp(time.time() + clock["offset_seconds"], ZoneInfo(clock["timezone"]))
+
+
+def _clock_env(clock: dict[str, Any] | None) -> dict[str, str]:
+    """Env vars that put a shell on the task clock (empty when no clock is set)."""
+    if clock is None:
+        return {}
+    out = {
+        "TZ": clock["timezone"],
+        "TASK_START_TIME": clock["start"].isoformat(),
+    }
+    lib = _find_libfaketime()
+    if lib:
+        out.update({
+            "LD_PRELOAD": lib,
+            "FAKETIME": f"{clock['offset_seconds']:+d}",
+            # Leave monotonic clocks real so sleeps and timeouts behave normally.
+            "FAKETIME_DONT_FAKE_MONOTONIC": "1",
+            "DONT_FAKE_MONOTONIC": "1",
+        })
+    return out
+
+
 def _solver_clean_env() -> dict[str, str]:
     """The solver shell's env: the container env minus every secret, with a non-root HOME/USER."""
     clean = dict(os.environ)
@@ -75,6 +163,7 @@ def _solver_clean_env() -> dict[str, str]:
             "TMPDIR": "/tmp",
         }
     )
+    clean.update(_clock_env(_TASK_CLOCK))
     return clean
 
 
@@ -254,18 +343,48 @@ def _zero(status: str, **info: Any) -> EvaluationResult:
     )
 
 
-def _workspace_preamble(deliverable_rel: str) -> str:
+def _workspace_preamble(deliverable_rel: str, clock: dict[str, Any] | None = None) -> str:
     """The environment contract prepended to every prompt: working dir, staged
-    inputs, and the deliverable path. Deliberately no navigation or anti-fabrication
-    coaching — ignoring the paths or inventing data is a real failure."""
+    inputs, the deliverable path, and the task's date and time when it sets one.
+    Deliberately no navigation or anti-fabrication coaching — ignoring the paths
+    or inventing data is a real failure."""
     ws = str(WORKSPACE_DIR)
     deliverable_abs = str((WORKSPACE_DIR / deliverable_rel))
+    when = ""
+    if clock is not None:
+        start = clock["start"]
+        when = (f"- Current date and time: {start.strftime('%A, %B')} {start.day}, "
+                f"{start.strftime('%Y %H:%M %Z')} ({clock['timezone']})\n")
     return (
         "[Environment]\n"
         f"- Working directory: {ws}\n"
         f"- Reference files for this task are staged at: {ws}/reference_files/\n"
-        f"- Save your deliverable to: {deliverable_abs}\n\n"
+        f"- Save your deliverable to: {deliverable_abs}\n"
+        f"{when}\n"
     )
+
+
+def _timing_info(clock: dict[str, Any] | None, started: float, ended: float) -> dict[str, Any]:
+    """Wall-clock span of the agent's turn (prompt sent -> answer back), plus the
+    task-clock span when one is set. Recorded on every grade, including zeros."""
+    def iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, dt_timezone.utc).isoformat()
+
+    info: dict[str, Any] = {
+        "agent_started_at": iso(started),
+        "agent_ended_at": iso(ended),
+        "agent_seconds": round(ended - started, 3),
+    }
+    if clock is not None:
+        zone = ZoneInfo(clock["timezone"])
+        info["task_clock_started_at"] = datetime.fromtimestamp(started + clock["offset_seconds"], zone).isoformat()
+        info["task_clock_ended_at"] = datetime.fromtimestamp(ended + clock["offset_seconds"], zone).isoformat()
+        info["task_clock_faked_in_shell"] = _find_libfaketime() is not None
+    return info
+
+
+def _with_timing(result: EvaluationResult, timing: dict[str, Any]) -> EvaluationResult:
+    return result.model_copy(update={"info": {**(result.info or {}), "timing": timing}})
 
 
 def _stage_bundle(task_slug: str) -> None:
@@ -315,28 +434,37 @@ async def _grade(
 
 
 async def _run(task_slug: str, prompt: str, deliverable_rel: str,
-               grader_source: str, rubric_arg: Any) -> AsyncGenerator[Any, None]:
+               grader_source: str, rubric_arg: Any,
+               current_time: str = "", tz_name: str = "UTC") -> AsyncGenerator[Any, None]:
+    global _TASK_CLOCK
     if not task_slug:
         raise RuntimeError("task args must include task_slug")
+    clock = _parse_task_clock(current_time, tz_name)
     deliverable = _deliverable_path(deliverable_rel)
     deliverable.parent.mkdir(parents=True, exist_ok=True)
     _stage_bundle(task_slug)
     _chown_solver_workspace()
 
-    # Grading reads the deliverable FILE, not the text answer, so the sent value is ignored.
-    _ = yield _workspace_preamble(deliverable_rel) + prompt
+    _TASK_CLOCK = clock  # read by the solver shell's env on every command
+    try:
+        started = time.time()
+        # Grading reads the deliverable FILE, not the text answer, so the sent value is ignored.
+        _ = yield _workspace_preamble(deliverable_rel, clock) + prompt
+        timing = _timing_info(clock, started, time.time())
+    finally:
+        _TASK_CLOCK = None
 
     resolved_deliverable, resolution_info = _resolve_deliverable(deliverable)
     if resolved_deliverable is None:
-        yield _zero("missing_deliverable", **resolution_info)
+        yield _with_timing(_zero("missing_deliverable", **resolution_info), timing)
         return
     try:
         result = await _grade(task_slug, resolved_deliverable, grader_source, rubric_arg)
         if resolution_info:
             result = result.model_copy(update={"info": {**result.info, **resolution_info}})
-        yield result
+        yield _with_timing(result, timing)
     except Exception as exc:  # pragma: no cover - fail closed: any grader error scores 0
-        yield _zero("grader_error", reason=repr(exc)[:500])
+        yield _with_timing(_zero("grader_error", reason=repr(exc)[:500]), timing)
 
 
 @env.template(
@@ -350,7 +478,11 @@ async def gdpval_task(
     deliverable: str = "deliverable/report.md",
     grader_source: str = "",
     rubric: dict[str, Any] | None = None,
+    current_time: str = "",
+    timezone: str = "UTC",
 ) -> AsyncGenerator[Any, None]:
     # grader_source and rubric arrive as task args; the rubric is never in the image.
-    async for item in _run(task_slug, prompt, deliverable, grader_source, rubric):
+    # current_time / timezone optionally set the task clock (see "Task clock" above).
+    async for item in _run(task_slug, prompt, deliverable, grader_source, rubric,
+                           current_time, timezone):
         yield item

@@ -12,9 +12,10 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"
 
 # Doc/spreadsheet tooling libs + inspection utilities, plus util-linux for `setpriv`
-# (the solver-shell uid drop). No bubblewrap: it breaks shells on the hosted runner.
+# (the solver-shell uid drop), and libfaketime + tzdata for the optional task clock.
+# No bubblewrap: it breaks shells on the hosted runner.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        file less libxml2 libxslt1.1 ripgrep unzip util-linux \
+        file less libfaketime libxml2 libxslt1.1 ripgrep tzdata unzip util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

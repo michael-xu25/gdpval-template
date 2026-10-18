@@ -19,9 +19,13 @@ SLUG = "acct-afc-audit-sampling"
 
 # ── parsing ────────────────────────────────────────────────────────────────
 
-def test_no_clock_by_default():
-    assert env_mod._parse_task_clock("", "UTC") is None
-    assert env_mod._parse_task_clock("   ", "America/Chicago") is None
+def test_clock_defaults_to_real_time():
+    for blank, zone in (("", "UTC"), ("   ", "America/Chicago")):
+        clock = env_mod._parse_task_clock(blank, zone)
+        assert clock["set_by_task"] is False and clock["offset_seconds"] == 0
+        assert clock["timezone"] == zone
+        env = env_mod._clock_env(clock)
+        assert env["TZ"] == zone and "LD_PRELOAD" not in env and "FAKETIME" not in env   # real time: nothing faked
 
 
 def test_naive_time_is_read_in_the_given_zone():
@@ -100,13 +104,15 @@ async def test_run_with_clock(monkeypatch, tmp_path):
     assert datetime.fromisoformat(timing["task_clock_ended_at"]) > datetime.fromisoformat(timing["task_clock_started_at"])
 
 
-async def test_run_without_clock_is_unchanged_but_timed(monkeypatch, tmp_path):
+async def test_run_without_current_time_uses_real_time(monkeypatch, tmp_path):
     monkeypatch.setattr(env_mod, "WORKSPACE_DIR", tmp_path)
     gen = env_mod._run(**_args())
     prompt = await gen.__anext__()
-    assert "Current date and time" not in prompt
+    assert "Current date and time" in prompt
     result = await gen.asend("done")
-    assert set(result.info["timing"]) == {"agent_started_at", "agent_ended_at", "agent_seconds"}
+    timing = result.info["timing"]
+    assert timing["task_clock_set_by_task"] is False and timing["task_clock_faked_in_shell"] is False
+    assert {"agent_started_at", "agent_ended_at", "agent_seconds", "task_clock_started_at"} <= set(timing)
 
 
 # ── over the wire (LocalRuntime): the new args survive manifest + coercion ──

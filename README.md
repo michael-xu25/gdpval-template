@@ -40,9 +40,11 @@ native_grading.py  # adapter over hud.graders + the fabrication cap
   agent's turn and `agent_seconds`, so slow or stalled runs show up next to the
   reward. (Per-step timestamps already live on the SDK trace.)
 
-### Task clock (optional)
+### Task clock
 
-Tasks set at a specific moment can pin the agent's "now". Add `current_time`
+Every task has a clock: the prompt preamble states the current date and time and
+the solver shell gets `TZ`. With no `current_time` that is the real time, so
+nothing is faked. Tasks set at a specific moment pin the agent's "now": add `current_time`
 (ISO 8601) and optionally `timezone` (IANA name, default `UTC`) to a task's
 `TASK_ARGS`:
 
@@ -50,11 +52,11 @@ Tasks set at a specific moment can pin the agent's "now". Add `current_time`
 TASK_ARGS = {..., "current_time": "2001-03-05T14:00:00", "timezone": "America/Chicago"}
 ```
 
-The prompt preamble states the date and time, the solver shell gets `TZ`, and in
-the image (which ships `libfaketime`) every process in the shell — `date`,
+Then, in the image (which ships `libfaketime`) every process in the shell — `date`,
 Python, LibreOffice — reads the task's time, advancing in real time from task
 start. Monotonic clocks stay real. The grade's `timing` block adds
-`task_clock_started_at` / `task_clock_ended_at`. Off Linux (no libfaketime) only
+`task_clock_started_at` / `task_clock_ended_at`, `task_clock_set_by_task` and
+`task_clock_faked_in_shell`. Off Linux (no libfaketime) only
 the prompt line and `TZ` apply. File modification times are set by the kernel,
 so they stay real.
 

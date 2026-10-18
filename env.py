@@ -66,15 +66,17 @@ env = Environment(name="gdpval-template")
 
 
 # ---------------------------------------------------------------------------
-# Task clock: an optional in-world "now" for the solver shell.
+# Task clock: an in-world "now" for the solver shell. Always on.
 #
 # Knowledge-work tasks are often set at a specific moment (a Q3 close, a reply due
 # before Friday's call, an email archive frozen at a cutoff). Without a clock the
 # agent's `date` and every library it calls report the container's real time, so a
-# memo "dated today" carries the wrong date. A task opts in with `current_time`
-# (ISO 8601) and optionally `timezone` (IANA name). The prompt states the time, the
-# shell gets TZ, and — where libfaketime is installed (the image) — every process
-# in the shell sees the task's time, advancing at real speed from task start.
+# memo "dated today" carries the wrong date. Every task gets a clock: the prompt
+# states the current time and the shell gets TZ. A task sets its moment with
+# `current_time` (ISO 8601) and optionally `timezone` (IANA name); then — where
+# libfaketime is installed (the image) — every process in the shell sees the task's
+# time, advancing at real speed from task start. Without `current_time` the clock
+# reads the real time, so nothing is faked.
 # ---------------------------------------------------------------------------
 
 # The active task's clock; set at task start, cleared when the task finishes.
@@ -97,18 +99,18 @@ def _find_libfaketime() -> str | None:
 
 
 def _parse_task_clock(current_time: str, tz_name: str) -> dict[str, Any] | None:
-    """Validate the clock args. Returns None when the task sets no clock.
+    """Validate the clock args. Without `current_time` the clock is the real time now.
 
     A naive `current_time` is read in `tz_name`; one with an offset is converted
     to it. The offset is fixed at task start, so the shell clock then advances in
     real time and stays consistent across commands.
     """
-    if not (current_time or "").strip():
-        return None
     try:
         zone = ZoneInfo(tz_name or "UTC")
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise RuntimeError(f"unknown timezone {tz_name!r}") from exc
+    if not (current_time or "").strip():
+        return {"start": datetime.now(zone), "timezone": zone.key, "offset_seconds": 0, "set_by_task": False}
     try:
         moment = datetime.fromisoformat(current_time.strip())
     except ValueError as exc:
@@ -120,6 +122,7 @@ def _parse_task_clock(current_time: str, tz_name: str) -> dict[str, Any] | None:
         # task time minus wall time, in whole seconds (libfaketime's relative form).
         # Rounded up, so the shell clock never reads earlier than current_time.
         "offset_seconds": math.ceil(moment.timestamp() - time.time()),
+        "set_by_task": True,
     }
 
 
@@ -136,7 +139,7 @@ def _clock_env(clock: dict[str, Any] | None) -> dict[str, str]:
         "TZ": clock["timezone"],
         "TASK_START_TIME": clock["start"].isoformat(),
     }
-    lib = _find_libfaketime()
+    lib = _find_libfaketime() if clock.get("set_by_task") else None   # real time needs no faking
     if lib:
         out.update({
             "LD_PRELOAD": lib,
@@ -379,7 +382,8 @@ def _timing_info(clock: dict[str, Any] | None, started: float, ended: float) -> 
         zone = ZoneInfo(clock["timezone"])
         info["task_clock_started_at"] = datetime.fromtimestamp(started + clock["offset_seconds"], zone).isoformat()
         info["task_clock_ended_at"] = datetime.fromtimestamp(ended + clock["offset_seconds"], zone).isoformat()
-        info["task_clock_faked_in_shell"] = _find_libfaketime() is not None
+        info["task_clock_set_by_task"] = clock.get("set_by_task", False)
+        info["task_clock_faked_in_shell"] = clock.get("set_by_task", False) and _find_libfaketime() is not None
     return info
 
 
@@ -482,7 +486,7 @@ async def gdpval_task(
     timezone: str = "UTC",
 ) -> AsyncGenerator[Any, None]:
     # grader_source and rubric arrive as task args; the rubric is never in the image.
-    # current_time / timezone optionally set the task clock (see "Task clock" above).
+    # current_time / timezone set the task clock (real time if current_time is empty; see "Task clock" above).
     async for item in _run(task_slug, prompt, deliverable, grader_source, rubric,
                            current_time, timezone):
         yield item

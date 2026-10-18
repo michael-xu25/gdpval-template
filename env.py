@@ -111,12 +111,29 @@ def _chown_solver_workspace() -> None:
         print(f"[gdpval-env] warning: chown failed: {exc}", file=sys.stderr)
 
 
+def _check_solver_tools() -> None:
+    """Fail at startup if the agent's own shell can't import the document libraries.
+
+    Runs the exact command form the agent gets (login shell, uid 1000, cleaned env), and only
+    inside the image, where that shell exists. Tests run as root, so they can't see this.
+    """
+    if not Path("/workspace").exists() or sys.platform == "win32":
+        return
+    argv = _ws.shell_argv("python3 -c 'import docx, openpyxl, pptx, pypdf'")
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "agent shell can't import the document libraries: " + (result.stderr or result.stdout)[-400:]
+        )
+
+
 @env.initialize
 async def _up() -> None:
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     _chown_solver_workspace()
     await _ws.start()
     env.add_capability(_ws.capability("shell"))
+    _check_solver_tools()
 
 
 @env.shutdown
